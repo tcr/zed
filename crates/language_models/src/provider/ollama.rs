@@ -21,6 +21,7 @@ use settings::{Settings, SettingsStore, update_settings_file};
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::usize;
 use std::{collections::HashMap, sync::Arc};
 use ui::{
     ButtonLike, ButtonLink, ConfiguredApiCard, ElevationIndex, List, ListBulletItem, Tooltip,
@@ -45,6 +46,7 @@ pub struct OllamaSettings {
     pub api_url: String,
     pub auto_discover: bool,
     pub available_models: Vec<AvailableModel>,
+    pub token_limit: Option<u64>,
 }
 
 pub struct OllamaLanguageModelProvider {
@@ -52,11 +54,25 @@ pub struct OllamaLanguageModelProvider {
     state: Entity<State>,
 }
 
+/// Manages the token limit for all models. Ollama determines the token limit
+/// by querying the user's system, but may perform subotimally if a very large
+/// token limit is permitted. This sets the maximum bound on this value.
+pub struct TokenLimitState {
+    pub limit: u64,
+}
+
+impl TokenLimitState {
+    pub fn new(limit: u64) -> Self {
+        Self { limit }
+    }
+}
+
 pub struct State {
     api_key_state: ApiKeyState,
     http_client: Arc<dyn HttpClient>,
     fetched_models: Vec<ollama::Model>,
     fetch_model_task: Option<Task<Result<()>>>,
+    token_limit_state: TokenLimitState,
 }
 
 impl State {
@@ -77,6 +93,10 @@ impl State {
                 .ok();
             result
         })
+    }
+
+    fn set_token_limit(&mut self, limit: Option<u64>) -> () {
+        self.token_limit_state.limit = limit.unwrap_or(0);
     }
 
     fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
@@ -100,6 +120,11 @@ impl State {
         let http_client = Arc::clone(&self.http_client);
         let api_url = OllamaLanguageModelProvider::api_url(cx);
         let api_key = self.api_key_state.key(&api_url);
+        let token_limit = if self.token_limit_state.limit == 0 {
+            None
+        } else {
+            Some(self.token_limit_state.limit)
+        };
 
         // As a proxy for the server being "authenticated", we'll check if its up by fetching the models
         cx.spawn(async move |this, cx| {
@@ -120,10 +145,21 @@ impl State {
                         let model =
                             show_model(http_client.as_ref(), &api_url, api_key.as_deref(), name)
                                 .await?;
+                        let max_tokens = if token_limit.is_none() || token_limit.unwrap() == 0 {
+                            model.context_length
+                        } else if model.context_length.is_some() {
+                            Some(std::cmp::min(
+                                token_limit.unwrap(),
+                                model.context_length.unwrap(),
+                            ))
+                        } else {
+                            token_limit
+                        };
+                        log::info!("{} -> {:?} vs {:?}", name, model.context_length, max_tokens,);
                         let ollama_model = ollama::Model::new(
                             name,
                             None,
-                            model.context_length,
+                            max_tokens,
                             Some(model.supports_tools()),
                             Some(model.supports_vision()),
                             Some(model.supports_thinking()),
@@ -184,6 +220,7 @@ impl OllamaLanguageModelProvider {
                     fetched_models: Default::default(),
                     fetch_model_task: None,
                     api_key_state: ApiKeyState::new(Self::api_url(cx), (*API_KEY_ENV_VAR).clone()),
+                    token_limit_state: TokenLimitState::new(Self::token_limit(cx).unwrap_or(0)),
                 }
             }),
         };
@@ -201,6 +238,10 @@ impl OllamaLanguageModelProvider {
         } else {
             SharedString::new(api_url.as_str())
         }
+    }
+
+    fn token_limit(cx: &App) -> Option<u64> {
+        return Self::settings(cx).token_limit;
     }
 }
 
@@ -603,6 +644,7 @@ struct ConfigurationView {
     api_key_editor: Entity<InputField>,
     api_url_editor: Entity<InputField>,
     state: Entity<State>,
+    token_limit_editor: Entity<InputField>,
 }
 
 impl ConfigurationView {
@@ -615,6 +657,19 @@ impl ConfigurationView {
             input
         });
 
+        let token_limit_editor = cx.new(|cx| {
+            let input = InputField::new(window, cx, "0 by default for unbounded, e.g. 128000")
+                .label("Token Limit");
+            input.set_text(
+                OllamaLanguageModelProvider::token_limit(cx)
+                    .map(|x| x.to_string())
+                    .unwrap_or("".to_string()),
+                window,
+                cx,
+            );
+            input
+        });
+
         cx.observe(&state, |_, _, cx| {
             cx.notify();
         })
@@ -624,6 +679,7 @@ impl ConfigurationView {
             api_key_editor,
             api_url_editor,
             state,
+            token_limit_editor,
         }
     }
 
@@ -695,6 +751,38 @@ impl ConfigurationView {
                 settings.api_url = Some(OLLAMA_API_URL.into());
             }
         });
+        cx.notify();
+    }
+
+    fn save_token_limit(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let token_limit = self
+            .token_limit_editor
+            .read(cx)
+            .text(cx)
+            .trim()
+            .to_string()
+            .parse::<u64>()
+            .ok();
+
+        let current_token_limit = OllamaLanguageModelProvider::token_limit(cx);
+        if token_limit != current_token_limit {
+            let fs = <dyn Fs>::global(cx);
+            update_settings_file(fs, cx, move |settings, _| {
+                settings
+                    .language_models
+                    .get_or_insert_default()
+                    .ollama
+                    .get_or_insert_default()
+                    .token_limit = token_limit;
+            });
+        }
+
+        let state = self.state.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            state.update(cx, |state, _cx| state.set_token_limit(token_limit))
+        })
+        .detach();
+
         cx.notify();
     }
 
@@ -799,6 +887,20 @@ impl ConfigurationView {
                 .child(self.api_url_editor.clone())
         }
     }
+
+    fn render_token_limit_editor(&self, cx: &Context<Self>) -> impl IntoElement {
+        v_flex()
+            .on_action(cx.listener(Self::save_token_limit))
+            .child(self.token_limit_editor.clone())
+            .child(
+                Label::new(format!(
+                    "Set the maximum token limit Zed will use for the Ollama provider."
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for ConfigurationView {
@@ -810,6 +912,7 @@ impl Render for ConfigurationView {
             .child(Self::render_instructions(cx))
             .child(self.render_api_url_editor(cx))
             .child(self.render_api_key_editor(cx))
+            .child(self.render_token_limit_editor(cx))
             .child(
                 h_flex()
                     .w_full()
